@@ -5,12 +5,22 @@ edition = "2021"
 description = "High-level UDP shred decoder with parallel Reed-Solomon recovery"
 
 [dependencies]
-# Pulled from crates.io; the top-level workspace applies a `[patch.crates-io]`
-# that redirects this to https://github.com/Minival1/solana-ledger-patched,
-# which widens `pub` visibility on `merkle::Shred` internals + `traits::Shred`
-# + `SIZE_OF_MERKLE_PROOF_ENTRY` so this crate can pattern-match directly
-# (mirrors what jito's `eric/v2.2-merkle-recovery` branch had done for 2.2.x).
-solana-ledger = "=2.3.1"
+# Our fork of Anza's `solana-ledger` 2.3.1 with widened `pub` visibility on
+# `merkle::Shred` internals + `traits::Shred` + `SIZE_OF_MERKLE_PROOF_ENTRY`
+# so this crate can pattern-match directly (mirrors what jito's
+# `eric/v2.2-merkle-recovery` branch had done for 2.2.x). Pinned as a direct
+# git dep so consumers don't need a `[patch.crates-io]` entry of their own —
+# just `shred-decoder = { git = ... }` works out of the box.
+#
+# Note: if the consumer also pulls `solana-ledger 2.3.1` from crates.io
+# elsewhere in the graph, cargo will see two copies with different sources.
+# In that case the consumer needs:
+#
+#   [patch.crates-io]
+#   solana-ledger = { git = "https://github.com/Minival1/solana-ledger-patched", branch = "main" }
+#
+# — to unify them. For self-contained test projects nothing extra is needed.
+solana-ledger = { git = "https://github.com/Minival1/solana-ledger-patched", branch = "main" }
 solana-perf = "=2.3.1"
 solana-streamer = "=2.3.1"
 solana-net-utils = "=2.3.1"
