@@ -7,7 +7,10 @@ use std::{
 };
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use solana_ledger::shred::{merkle::Shred, ReedSolomonCache};
+use solana_ledger::shred::{
+    merkle::{self, Shred},
+    ReedSolomonCache,
+};
 use solana_sdk::clock::Slot;
 use tracing::debug;
 
@@ -71,32 +74,7 @@ impl RecoveryPool {
     /// dominate the actual Reed-Solomon decode cost, e.g. for small FEC sets
     /// or under light load.
     pub fn recover_inline(&self, slot: Slot, fec_set_index: u32, shreds: Vec<Shred>) -> Vec<Shred> {
-        match solana_ledger::shred::merkle::recover(shreds, &self.inline_cache) {
-            Ok(recovered) => recovered
-                .into_iter()
-                .filter_map(|r| match r {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        debug!(
-                            slot,
-                            fec_set_index,
-                            error = %e,
-                            "shred-decoder: failed to recover individual shred (inline)"
-                        );
-                        None
-                    }
-                })
-                .collect(),
-            Err(e) => {
-                debug!(
-                    slot,
-                    fec_set_index,
-                    error = %e,
-                    "shred-decoder: FEC recovery failed (inline)"
-                );
-                Vec::new()
-            }
-        }
+        run_recovery(slot, fec_set_index, shreds, &self.inline_cache, "inline")
     }
 
     /// Non-blocking dispatch. Returns the job back to the caller if the queue is full,
@@ -143,32 +121,7 @@ fn worker_loop(
 
         let slot = job.slot;
         let fec_set_index = job.fec_set_index;
-        let recovered = match solana_ledger::shred::merkle::recover(job.shreds, &rs_cache) {
-            Ok(recovered) => recovered
-                .into_iter()
-                .filter_map(|r| match r {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        debug!(
-                            slot,
-                            fec_set_index,
-                            error = %e,
-                            "shred-decoder: failed to recover individual shred"
-                        );
-                        None
-                    }
-                })
-                .collect(),
-            Err(e) => {
-                debug!(
-                    slot,
-                    fec_set_index,
-                    error = %e,
-                    "shred-decoder: FEC recovery failed"
-                );
-                Vec::new()
-            }
-        };
+        let recovered = run_recovery(slot, fec_set_index, job.shreds, &rs_cache, "pool");
 
         if result_tx
             .send(RecoveryResult {
@@ -179,6 +132,47 @@ fn worker_loop(
             .is_err()
         {
             return;
+        }
+    }
+}
+
+/// Internal helper used by both the worker pool and the inline fast-path.
+///
+/// Uses `merkle::recover` directly — it's `pub` in the jito-solana 2.2 fork
+/// (`eric/v2.2-merkle-recovery`) and takes/returns `merkle::Shred`, so no
+/// conversion wrapping is needed.
+fn run_recovery(
+    slot: Slot,
+    fec_set_index: u32,
+    shreds: Vec<Shred>,
+    rs_cache: &ReedSolomonCache,
+    site: &'static str,
+) -> Vec<Shred> {
+    match merkle::recover(shreds, rs_cache) {
+        Ok(iter) => iter
+            .filter_map(|r| match r {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    debug!(
+                        slot,
+                        fec_set_index,
+                        site,
+                        error = %e,
+                        "shred-decoder: failed to recover individual shred"
+                    );
+                    None
+                }
+            })
+            .collect(),
+        Err(e) => {
+            debug!(
+                slot,
+                fec_set_index,
+                site,
+                error = %e,
+                "shred-decoder: FEC recovery failed"
+            );
+            Vec::new()
         }
     }
 }

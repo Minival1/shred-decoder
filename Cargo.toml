@@ -5,6 +5,12 @@ edition = "2024"
 description = "High-level UDP shred decoder with parallel Reed-Solomon recovery"
 
 [dependencies]
+# NOTE: pinned to 2.2.x because solana-ledger 2.3.x made `merkle::Shred`,
+# its fields, `layout::get_data`, `Shred::num_{data,coding}_shreds`, and
+# other internals `pub(super)`/`pub(crate)` — state.rs relies on direct
+# pattern matching against those. Bumping to 2.3 requires rewriting
+# ComparableShred against the public-only API. Consumers on 2.3.x need a
+# bincode boundary shim for `VersionedTransaction` until that rewrite.
 solana-ledger = { git = "https://github.com/jito-foundation/jito-solana.git", branch = "eric/v2.2-merkle-recovery" }
 solana-perf = "=2.2.1"
 solana-streamer = "=2.2.1"

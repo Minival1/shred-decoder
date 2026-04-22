@@ -158,7 +158,7 @@ impl ShredDecoderBuilder {
                 packet_tx.clone(),
                 recycler.clone(),
                 forward_stats.clone(),
-                Duration::default(),
+                Duration::default(), // coalesce
                 false,
                 None,
                 false,
