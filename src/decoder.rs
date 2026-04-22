@@ -36,6 +36,12 @@ const DEDUPER_FALSE_POSITIVE_RATE: f64 = 0.001;
 const DEDUPER_NUM_BITS: u64 = 637_534_199; // 76MB
 const DEDUPER_RESET_CYCLE: Duration = Duration::from_secs(5 * 60);
 const SLOT_LOOKBACK: Slot = 50;
+/// Recover synchronously on the ingest thread when at most this many data
+/// shreds are missing. Set to 0 to disable inline recovery entirely — all
+/// FEC recoveries go through the worker pool. Inline was tried empirically
+/// and regressed tail latency under this workload; keeping the branch in
+/// place so it can be re-enabled by raising this threshold.
+const INLINE_RECOVERY_MISSING_THRESHOLD: u16 = 0;
 
 pub struct DecoderStats {
     pub recovered_count: AtomicU64,
@@ -248,29 +254,52 @@ fn run_ingest_loop(
             &stats,
         );
 
-        // 2. Receive next packet batch (short timeout to keep polling recovery results).
-        match packet_rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(mut batch) => {
-                dedup_packets_and_count_discards(&deduper, std::slice::from_mut(&mut batch));
-
-                if last_dedup_reset.elapsed() >= Duration::from_secs(2) {
-                    deduper.maybe_reset(
-                        &mut rng,
-                        DEDUPER_FALSE_POSITIVE_RATE,
-                        DEDUPER_RESET_CYCLE,
-                    );
-                    last_dedup_reset = Instant::now();
-                }
-
-                ingest_batch(
-                    &batch,
+        // 2. Wait for *any* event — new packet batch OR a completed recovery.
+        //    Event-driven rather than polled: removes the fixed recv_timeout
+        //    window that otherwise caps how fast we can emit recovered txs.
+        let mut batch_opt: Option<solana_perf::packet::PacketBatch> = None;
+        let mut disconnected = false;
+        crossbeam_channel::select! {
+            recv(packet_rx) -> msg => match msg {
+                Ok(batch) => batch_opt = Some(batch),
+                Err(_) => disconnected = true,
+            },
+            recv(recovery_pool.result_receiver()) -> msg => match msg {
+                Ok(result) => apply_recovery_result(
+                    result,
                     &mut all_shreds,
-                    &mut highest_slot_seen,
                     &mut touched_fec_sets,
-                );
+                    &stats,
+                ),
+                Err(_) => {} // pool shutting down; fall through
+            },
+            default(Duration::from_millis(5)) => {
+                // Both queues empty — brief idle tick so exit flag is checked.
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if disconnected {
+            break;
+        }
+
+        if let Some(mut batch) = batch_opt {
+            dedup_packets_and_count_discards(&deduper, std::slice::from_mut(&mut batch));
+
+            if last_dedup_reset.elapsed() >= Duration::from_secs(2) {
+                deduper.maybe_reset(
+                    &mut rng,
+                    DEDUPER_FALSE_POSITIVE_RATE,
+                    DEDUPER_RESET_CYCLE,
+                );
+                last_dedup_reset = Instant::now();
+            }
+
+            ingest_batch(
+                &batch,
+                &mut all_shreds,
+                &mut highest_slot_seen,
+                &mut touched_fec_sets,
+            );
         }
 
         // 3. Dispatch recoveries for any FEC set with enough shreds.
@@ -279,6 +308,17 @@ fn run_ingest_loop(
             &mut all_shreds,
             &mut touched_fec_sets,
             &mut pending_shreds_buf,
+            &stats,
+        );
+
+        // 3b. Drain again before emit: workers may have completed a recovery
+        //     during steps 2-3, and we don't want to wait a whole tick to
+        //     surface those transactions.
+        drain_recovery_results(
+            &recovery_pool,
+            &mut all_shreds,
+            &mut touched_fec_sets,
+            &stats,
         );
 
         // 4. Deshred + deserialize + emit events for any completed FEC sets.
@@ -386,11 +426,14 @@ fn dispatch_recoveries(
     >,
     touched: &mut Vec<(Slot, u32)>,
     shreds_buf: &mut Vec<Shred>,
+    stats: &DecoderStats,
 ) {
     // Work on a sorted+deduped local copy so we don't double-dispatch the same FEC set
     // within one tick, and so we don't iterate the same entry multiple times.
     touched.sort_unstable();
     touched.dedup();
+
+    let mut pool_full = false;
 
     for (slot, fec_set_index) in touched.iter() {
         let Some((fec_map, state_tracker)) = all_shreds.get_mut(slot) else {
@@ -416,6 +459,8 @@ fn dispatch_recoveries(
             continue;
         }
 
+        let missing = num_expected_data.saturating_sub(num_data);
+
         shreds_buf.clear();
         shreds_buf.extend(
             shreds
@@ -423,22 +468,121 @@ fn dispatch_recoveries(
                 .sorted_by_key(|s| (u8::MAX - s.shred_type() as u8, s.index()))
                 .map(|s| s.0.clone()),
         );
+        let shreds_vec = std::mem::take(shreds_buf);
+
+        // Fast-path: small recoveries run synchronously. Channel + wake-up cost
+        // dominates the RS decode when only 1-2 data shreds are missing, and the
+        // ingest thread is already holding the mutable state we need to update.
+        if missing <= INLINE_RECOVERY_MISSING_THRESHOLD {
+            let recovered = pool.recover_inline(*slot, *fec_set_index, shreds_vec);
+
+            if recovered.is_empty() {
+                stats
+                    .fec_recovery_error_count
+                    .fetch_add(1, Ordering::Relaxed);
+                // Legacy-style: leave FEC set in memory; retry when a new
+                // shred arrives or slot ages out via SLOT_LOOKBACK cleanup.
+                continue;
+            }
+
+            let mut local_recovered = 0u64;
+            for shred in recovered {
+                if update_state_tracker(&shred, state_tracker).is_some() {
+                    local_recovered += 1;
+                }
+            }
+            if local_recovered > 0 {
+                stats
+                    .recovered_count
+                    .fetch_add(local_recovered, Ordering::Relaxed);
+            }
+
+            state_tracker.already_recovered_fec_sets[fec_idx] = true;
+            if let Some(shreds) = fec_map.get_mut(fec_set_index) {
+                shreds.clear();
+            }
+            // (*slot, *fec_set_index) is still in `touched`; emit_events will
+            // pick up the now-complete range on this same tick.
+            continue;
+        }
+
+        // Slow-path: many missing shreds → hand off to worker pool so the
+        // ingest thread isn't blocked on a big RS decode.
+        if pool_full {
+            continue;
+        }
         let job = RecoveryJob {
             slot: *slot,
             fec_set_index: *fec_set_index,
-            shreds: std::mem::take(shreds_buf),
+            shreds: shreds_vec,
         };
-
         match pool.try_dispatch(job) {
             Ok(()) => {
                 state_tracker.recovery_in_flight[fec_idx] = true;
             }
             Err(_) => {
-                // Queue full — try again next tick.
-                break;
+                // Queue full — stop dispatching this tick but keep looking for
+                // inline-eligible sets later in `touched`.
+                pool_full = true;
             }
         }
     }
+}
+
+fn apply_recovery_result(
+    result: RecoveryResult,
+    all_shreds: &mut ahash::HashMap<
+        Slot,
+        (
+            ahash::HashMap<u32, HashSet<ComparableShred>>,
+            ShredsStateTracker,
+        ),
+    >,
+    touched: &mut Vec<(Slot, u32)>,
+    stats: &DecoderStats,
+) {
+    let RecoveryResult {
+        slot,
+        fec_set_index,
+        recovered,
+    } = result;
+    let Some((fec_map, state_tracker)) = all_shreds.get_mut(&slot) else {
+        return;
+    };
+
+    let fec_idx = fec_set_index as usize;
+    state_tracker.recovery_in_flight[fec_idx] = false;
+
+    if recovered.is_empty() {
+        stats
+            .fec_recovery_error_count
+            .fetch_add(1, Ordering::Relaxed);
+        // Legacy-style: leave FEC set in memory. Retry happens naturally
+        // when another shred arrives for this (slot, fec_set_index) and
+        // re-adds it to `touched`. If no more shreds arrive, the slot
+        // ages out via SLOT_LOOKBACK cleanup below.
+        return;
+    }
+
+    let mut local_recovered = 0u64;
+    for shred in recovered {
+        if update_state_tracker(&shred, state_tracker).is_some() {
+            local_recovered += 1;
+        }
+    }
+    if local_recovered > 0 {
+        stats
+            .recovered_count
+            .fetch_add(local_recovered, Ordering::Relaxed);
+    }
+
+    state_tracker.already_recovered_fec_sets[fec_idx] = true;
+    if let Some(shreds) = fec_map.get_mut(&fec_set_index) {
+        shreds.clear();
+    }
+
+    // Re-visit this FEC set in this same tick's deshred pass.
+    touched.push((slot, fec_set_index));
 }
 
 fn drain_recovery_results(
@@ -453,49 +597,8 @@ fn drain_recovery_results(
     touched: &mut Vec<(Slot, u32)>,
     stats: &DecoderStats,
 ) {
-    while let Some(RecoveryResult {
-        slot,
-        fec_set_index,
-        recovered,
-    }) = pool.try_recv()
-    {
-        let Some((fec_map, state_tracker)) = all_shreds.get_mut(&slot) else {
-            continue;
-        };
-
-        let fec_idx = fec_set_index as usize;
-        state_tracker.recovery_in_flight[fec_idx] = false;
-
-        if recovered.is_empty() {
-            stats
-                .fec_recovery_error_count
-                .fetch_add(1, Ordering::Relaxed);
-            // Legacy-style: leave FEC set in memory. Retry happens naturally
-            // when another shred arrives for this (slot, fec_set_index) and
-            // re-adds it to `touched`. If no more shreds arrive, the slot
-            // ages out via SLOT_LOOKBACK cleanup below.
-            continue;
-        }
-
-        let mut local_recovered = 0u64;
-        for shred in recovered {
-            if update_state_tracker(&shred, state_tracker).is_some() {
-                local_recovered += 1;
-            }
-        }
-        if local_recovered > 0 {
-            stats
-                .recovered_count
-                .fetch_add(local_recovered, Ordering::Relaxed);
-        }
-
-        state_tracker.already_recovered_fec_sets[fec_idx] = true;
-        if let Some(shreds) = fec_map.get_mut(&fec_set_index) {
-            shreds.clear();
-        }
-
-        // Re-visit this FEC set in this same tick's deshred pass.
-        touched.push((slot, fec_set_index));
+    while let Some(result) = pool.try_recv() {
+        apply_recovery_result(result, all_shreds, touched, stats);
     }
 }
 

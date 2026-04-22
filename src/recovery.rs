@@ -28,6 +28,10 @@ pub(crate) struct RecoveryPool {
     result_rx: Receiver<RecoveryResult>,
     handles: Vec<JoinHandle<()>>,
     exit: Arc<AtomicBool>,
+    /// Cache used only by the ingest thread's inline recoveries. Kept
+    /// separate from `worker_cache` so that inline calls don't contend
+    /// with pool workers on the cache's internal locks.
+    inline_cache: Arc<ReedSolomonCache>,
 }
 
 impl RecoveryPool {
@@ -37,13 +41,14 @@ impl RecoveryPool {
         let (job_tx, job_rx) = bounded::<RecoveryJob>(queue_depth);
         let (result_tx, result_rx) = bounded::<RecoveryResult>(queue_depth);
         let exit = Arc::new(AtomicBool::new(false));
-        let rs_cache = Arc::new(ReedSolomonCache::default());
+        let worker_cache = Arc::new(ReedSolomonCache::default());
+        let inline_cache = Arc::new(ReedSolomonCache::default());
 
         let mut handles = Vec::with_capacity(workers);
         for worker_id in 0..workers {
             let job_rx = job_rx.clone();
             let result_tx = result_tx.clone();
-            let rs_cache = rs_cache.clone();
+            let rs_cache = worker_cache.clone();
             let exit = exit.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("shredRecover{worker_id}"))
@@ -57,6 +62,40 @@ impl RecoveryPool {
             result_rx,
             handles,
             exit,
+            inline_cache,
+        }
+    }
+
+    /// Synchronous recovery on the caller's thread. Use this when dispatch
+    /// overhead (channel send + worker wake-up + result poll) is likely to
+    /// dominate the actual Reed-Solomon decode cost, e.g. for small FEC sets
+    /// or under light load.
+    pub fn recover_inline(&self, slot: Slot, fec_set_index: u32, shreds: Vec<Shred>) -> Vec<Shred> {
+        match solana_ledger::shred::merkle::recover(shreds, &self.inline_cache) {
+            Ok(recovered) => recovered
+                .into_iter()
+                .filter_map(|r| match r {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        debug!(
+                            slot,
+                            fec_set_index,
+                            error = %e,
+                            "shred-decoder: failed to recover individual shred (inline)"
+                        );
+                        None
+                    }
+                })
+                .collect(),
+            Err(e) => {
+                debug!(
+                    slot,
+                    fec_set_index,
+                    error = %e,
+                    "shred-decoder: FEC recovery failed (inline)"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -72,6 +111,12 @@ impl RecoveryPool {
 
     pub fn try_recv(&self) -> Option<RecoveryResult> {
         self.result_rx.try_recv().ok()
+    }
+
+    /// Direct access to the result channel so callers can compose it into a
+    /// `crossbeam_channel::select!` alongside their own sources.
+    pub fn result_receiver(&self) -> &Receiver<RecoveryResult> {
+        &self.result_rx
     }
 
     pub fn shutdown(self) {
