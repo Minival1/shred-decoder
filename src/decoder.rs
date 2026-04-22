@@ -158,7 +158,7 @@ impl ShredDecoderBuilder {
                 packet_tx.clone(),
                 recycler.clone(),
                 forward_stats.clone(),
-                Duration::default(), // coalesce
+                None, // coalesce: Option<Duration> since solana-streamer 2.3
                 false,
                 None,
                 false,
